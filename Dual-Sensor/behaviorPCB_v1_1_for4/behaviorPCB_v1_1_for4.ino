@@ -1,5 +1,14 @@
 #include <SPI.h>
 #include <avr/pgmspace.h>
+#include <cstring>
+#include <cstdlib>
+
+// Automatically increment to equal ms since last set to 0
+elapsedMillis sinceLastRead;
+elapsedMillis sinceLastMessage;
+elapsedMicros sinceLastLoop;
+elapsedMillis sinceValveOn;
+elapsedMillis sinceValveOff;
 
 byte initComplete=0;
 byte Motion = 0;
@@ -12,15 +21,17 @@ int xy2dat[2];
 double dP;
 double dR;
 double dY;
-int pCum = 0;
-int rCum = 0;
-int yCum = 0;
 
 const int ncs = 0;
 const int ncs2 = 1;
 const int pVelPin = 3;
 const int rVelPin = 4;
 const int yVelPin = 5;
+// const int valve1Pin = 14;
+// const int valve2Pin = 15;
+const int lickPin = 16;
+// const int lick2Pin = 17;
+const int valvePin = 22;
 
 const double px1 = 0.8151;
 const double rx1 = 0.1849;
@@ -34,6 +45,27 @@ const double yx2 = 0.5959;
 const double py2 = -0.2414;
 const double ry2 = 0.2414;
 const double yy2 = -0.7779;
+
+char* usbBuffer = NULL;
+size_t usbBufferLength;
+
+byte valveState = 0;
+byte holdOpen = 0;
+unsigned long valveDur = 0;
+const int timeoutDur = 100; // ms to hold between drops, to prevent nonlinear effects w/ multiple drops when calibrating
+int dropsToDispense = 0;
+
+// long lickCount1 = 0;
+// long lickCount2 = 0;
+long lickCount = 0;
+
+// unsigned int lastLick1 = 0;
+// unsigned int lastLick2 = 0;
+unsigned int lastLick = 0;
+unsigned long dt;
+
+// To maintain mean since last read
+double loopsSinceRead = 0.0;
 
 //const double px1 = 1;
 //const double rx1 = 0;
@@ -95,57 +127,101 @@ const double yy2 = -0.7779;
 #define REG_SROM_Load_Burst                      0x62
 #define REG_Pixel_Burst                          0x64
 
+// uncomment to only read velocity every X ms
+// #define READ_INTERVAL_MS 10
+#define ADNS_SETTINGS SPISettings(2000000, MSBFIRST, SPI_MODE3)
+// #define DEBUG
+
 extern const unsigned short firmware_length;
 extern prog_uchar firmware_data[];
 
 void setup() {
-  Serial.begin(38400);
+
+// set up serial and print so that matlab knows it is working
+  while(!Serial) delay(10);
+  Serial.print("Baud rate: ");
+  Serial.println(Serial.baud());
+
   analogWriteFrequency(pVelPin,11500);
   analogWriteFrequency(rVelPin,11500);
   analogWriteFrequency(yVelPin,11500);
   analogWriteResolution(12);
-  pinMode (ncs, OUTPUT);
-  pinMode (ncs2, OUTPUT);
+  pinMode(ncs, OUTPUT);
+  pinMode(ncs2, OUTPUT);
   
+  pinMode(valvePin,OUTPUT);
+  pinMode(lickPin,INPUT);
+
+  adns_reset_cs();
   SPI.begin();
-  SPI.setDataMode(SPI_MODE3);
-  SPI.setBitOrder(MSBFIRST);
-  SPI.setClockDivider(2);
   
   delay(1000);
   performStartup();
   delay(10);
   performStartup2();
   delay(10);
+  adns_write_reg(REG_Configuration_I, 0x10);
   //adns_write_reg(REG_Configuration_I, 0x29); // maximum resolution
-  adns_write_reg(REG_Configuration_I, 0x09); // default resolution
+  //adns_write_reg(REG_Configuration_I, 0x09); // default resolution
   //adns_write_reg(REG_Configuration_I, 0x01); // minimum resolution
   delay(10);
-  adns2_write_reg(REG_Configuration_I, 0x09); // default resolution
+  adns2_write_reg(REG_Configuration_I, 0x10);
+  //adns2_write_reg(REG_Configuration_I, 0x09); // default resolution
   //adns2_write_reg(REG_Configuration_I, 0x01); // minimum resolution
   delay(1500);  
-  dispRegisters();
-  delay(1500);
-  dispRegisters2();
-  delay(1500);
+  // dispRegisters();
+  // delay(1500);
+  // dispRegisters2();
+  // delay(1500);
+
+  // Initialize usbBuffer to hold 10 characters - should realistically never have to expand
+  setBufferSize(10);
+
   initComplete=9;
 
 }
 
+void setBufferSize(size_t n) {
+  if (usbBuffer == NULL) {
+    usbBuffer = (char*) malloc((n + 1) * sizeof(char));
+  } else {
+    usbBuffer = (char*) realloc(usbBuffer, (n + 1) * sizeof(char));
+  }
+
+  if (usbBuffer == NULL) {
+    Serial.println("Unable to allocate memory - aborting!");
+    while (true) {
+      delay(100);
+    }
+  } else {
+    usbBufferLength = n;
+  }
+}
+
+void adns_reset_cs() {
+  // Reset chip select lines to pre-transaction state
+  digitalWrite(ncs, HIGH);
+  digitalWrite(ncs2, HIGH);
+}
+
 void adns_com_begin(){
+  SPI.beginTransaction(ADNS_SETTINGS);
   digitalWrite(ncs, LOW);
 }
 
 void adns2_com_begin(){
+  SPI.beginTransaction(ADNS_SETTINGS);
   digitalWrite(ncs2, LOW);
 }
 
 void adns_com_end(){
   digitalWrite(ncs, HIGH);
+  SPI.endTransaction();
 }
 
 void adns2_com_end(){
   digitalWrite(ncs2, HIGH);
+  SPI.endTransaction();
 }
 
 byte adns_read_reg(byte reg_addr){
@@ -208,7 +284,7 @@ void adns2_write_reg(byte reg_addr, byte data){
 
 void adns_upload_firmware(){
   // send the firmware to the chip, cf p.18 of the datasheet
-  Serial.println("Uploading firmware to chip 1...");
+//  Serial.println("Uploading firmware to chip 1...");
   // set the configuration_IV register in 3k firmware mode
   adns_write_reg(REG_Configuration_IV, 0x02); // bit 1 = 1 for 3k mode, other bits are reserved 
   
@@ -238,7 +314,7 @@ void adns_upload_firmware(){
 
 void adns2_upload_firmware(){
   // send the firmware to the chip, cf p.18 of the datasheet
-  Serial.println("Uploading firmware to chip 2...");
+  //Serial.println("Uploading firmware to chip 2...");
   // set the configuration_IV register in 3k firmware mode
   adns2_write_reg(REG_Configuration_IV, 0x02); // bit 1 = 1 for 3k mode, other bits are reserved 
   
@@ -268,9 +344,9 @@ void adns2_upload_firmware(){
 
 
 void performStartup(void){
-  adns_com_end(); // ensure that the serial port is reset
-  adns_com_begin(); // ensure that the serial port is reset
-  adns_com_end(); // ensure that the serial port is reset
+  // adns_com_end(); // ensure that the serial port is reset - this is really a digital pin
+  adns_com_begin(); // ensure that the serial port is reset - digital pin
+  adns_com_end(); // ensure that the serial port is reset - digital pin
   adns_write_reg(REG_Power_Up_Reset, 0x5a); // force reset
   delay(50); // wait for it to reboot
   // read registers 0x02 to 0x06 (and discard the data)
@@ -291,11 +367,11 @@ void performStartup(void){
   
   delay(10);
 
-  Serial.println("Optical Chip 1 Initialized");
+  // Serial.println("Optical Chip 1 Initialized");
 }
 
 void performStartup2(void){
-  adns2_com_end(); // ensure that the serial port is reset
+  // adns2_com_end(); // ensure that the serial port is reset
   adns2_com_begin(); // ensure that the serial port is reset
   adns2_com_end(); // ensure that the serial port is reset
   adns2_write_reg(REG_Power_Up_Reset, 0x5a); // force reset
@@ -318,62 +394,62 @@ void performStartup2(void){
   
   delay(10);
 
-  Serial.println("Optical Chip 2 Initialized");
+  //Serial.println("Optical Chip 2 Initialized");
 }
 
 
-void dispRegisters(void){
-  int oreg[7] = {
-    0x00,0x3F,0x2A,0x0F  };
-  char* oregname[] = {
-    "Product_ID","Inverse_Product_ID","SROM_Version","CPI"  };
-  byte regres;
+// void dispRegisters(void){
+//   int oreg[7] = {
+//     0x00,0x3F,0x2A,0x0F  };
+//   const char* oregname[] = {
+//     "Product_ID","Inverse_Product_ID","SROM_Version","CPI"  };
+//   byte regres;
 
-  digitalWrite(ncs,LOW);
+//   adns_com_begin();
 
-  int rctr=0;
-  for(rctr=0; rctr<4; rctr++){
-    SPI.transfer(oreg[rctr]);
-    delay(1);
-    Serial.println("---");
-    Serial.println(oregname[rctr]);
-    Serial.println(oreg[rctr],HEX);
-    regres = SPI.transfer(0);
-    Serial.println(regres,BIN);  
-    Serial.println(regres,HEX);  
-    delay(1);
-  }
-  digitalWrite(ncs,HIGH);
-}
+//   int rctr=0;
+//   for(rctr=0; rctr<4; rctr++){
+//     SPI.transfer(oreg[rctr]);
+//     delay(1);
+//     // Serial.println("---");
+//     // Serial.println(oregname[rctr]);
+//     // Serial.println(oreg[rctr],HEX);
+//     regres = SPI.transfer(0);
+//     // // Serial.println(regres,BIN);  
+//     // Serial.println(regres,HEX);  
+//     delay(1);
+//   }
+//   adns_com_end();
+// }
 
-void dispRegisters2(void){
-  int oreg[7] = {
-    0x00,0x3F,0x2A,0x0F  };
-  char* oregname[] = {
-    "Product_ID2","Inverse_Product_ID2","SROM_Version2","CPI2"  };
-  byte regres;
+// void dispRegisters2(void){
+//   int oreg[7] = {
+//     0x00,0x3F,0x2A,0x0F  };
+//   const char* oregname[] = {
+//     "Product_ID2","Inverse_Product_ID2","SROM_Version2","CPI2"  };
+//   byte regres;
 
-  digitalWrite(ncs2,LOW);
+//   adns2_com_begin();
 
-  int rctr=0;
-  for(rctr=0; rctr<4; rctr++){
-    SPI.transfer(oreg[rctr]);
-    delay(1);
-    Serial.println("---");
-    Serial.println(oregname[rctr]);
-    Serial.println(oreg[rctr],HEX);
-    regres = SPI.transfer(0);
-    Serial.println(regres,BIN);  
-    Serial.println(regres,HEX);  
-    delay(1);
-  }
-  digitalWrite(ncs2,HIGH);
-}
+//   int rctr=0;
+//   for(rctr=0; rctr<4; rctr++){
+//     SPI.transfer(oreg[rctr]);
+//     delay(1);
+//     // Serial.println("---");
+//     // Serial.println(oregname[rctr]);
+//     // Serial.println(oreg[rctr],HEX);
+//     regres = SPI.transfer(0);
+//     // Serial.println(regres,BIN);  
+//     // Serial.println(regres,HEX);  
+//     delay(1);
+//   }
+//   adns2_com_end();
+// }
 
-int readXY(int *xy){
+void readXY(int *xy){
   //digitalWrite(ncs,LOW);
   
-  Motion = (adns_read_reg(REG_Motion) & (1 << 8-1)) != 0;
+  Motion = (adns_read_reg(REG_Motion) & (1 << 7)) != 0;
   xL = adns_read_reg(REG_Delta_X_L);
   xH = adns_read_reg(REG_Delta_X_H);
   yL = adns_read_reg(REG_Delta_Y_L);
@@ -391,10 +467,10 @@ int readXY(int *xy){
   //digitalWrite(ncs,HIGH);     
 }
 
-int readXY2(int *xy){
+void readXY2(int *xy){
   //digitalWrite(ncs2,LOW);
   
-  Motion = (adns2_read_reg(REG_Motion) & (1 << 8-1)) != 0;
+  Motion = (adns2_read_reg(REG_Motion) & (1 << 7)) != 0;
   xL = adns2_read_reg(REG_Delta_X_L);
   xH = adns2_read_reg(REG_Delta_X_H);
   yL = adns2_read_reg(REG_Delta_Y_L);
@@ -412,30 +488,168 @@ int readXY2(int *xy){
   //digitalWrite(ncs2,HIGH);     
 }
 
-  
-  void loop() {
-    Serial.println("Made it 0");
-    readXY(&xydat[0]);
-    Serial.println("Made it 1");
-    readXY2(&xy2dat[0]);
-    Serial.println("Made it 2");
-    dP = px1*xydat[0] + py1*xydat[1] + px2*xy2dat[0] + py2*xy2dat[1];
-    dR = rx1*xydat[0] + ry1*xydat[1] + rx2*xy2dat[0] + ry2*xy2dat[1];
-    dY = yx1*xydat[0] + yy1*xydat[1] + yx2*xy2dat[0] + yy2*xy2dat[1];
-    Serial.println("Made it 3");
-    analogWrite(pVelPin,dP+2048);
-    analogWrite(rVelPin,dR+2048);
-    analogWrite(yVelPin,dY+2048);
-    pCum = pCum*0.9 + dP;
-    rCum = rCum*0.9 + dR;
-    yCum = yCum*0.9 + dY;
-    
-    Serial.println("Prod ID = " + String(adns_read_reg(REG_Product_ID)));
-    Serial.println("Prod2 ID = " + String(adns2_read_reg(REG_Product_ID)));
-    Serial.println("intP = " + String(pCum));
-    Serial.println("intR = " + String(rCum));
-    Serial.println("intY = " + String(yCum));
-    Serial.println("Squal = " + String(adns_read_reg(REG_SQUAL)));
-    Serial.println("Squal2 = " + String(adns2_read_reg(REG_SQUAL)));
-    delay(10);
+
+// Valve control
+void startRelease() {
+  digitalWrite(valvePin, HIGH);
+  sinceValveOn = 0;
+  valveState = 1;
+}
+
+void stopRelease() {
+  digitalWrite(valvePin, LOW);
+  sinceValveOff = 0;
+  valveState = 0;
+}
+
+
+void interpretCommand(char* message) {
+  size_t len = strlen(message);
+  if (len > 0) {
+    char char1 = message[0];
+    if (char1 == 'O') {
+      // Hold open
+      holdOpen = 1;
+      startRelease();
+#ifdef DEBUG
+      Serial.println("Holding valve open");
+#endif
+    } else if (char1 == 'C') {
+      // Stop holding
+      holdOpen = 0;
+      stopRelease();
+#ifdef DEBUG
+      Serial.println("Closing valve");
+#endif
+    } else {
+      bool succeeded = false;
+      // Get # of ms to open valve for each drop
+      char* tok = strtok(message, "xX");
+      if (tok != NULL) {
+        int parsedDur = atoi(tok);
+        if (parsedDur > 0) {
+          // Get # of drops to release
+          tok = strtok(NULL, "xX");
+          if (tok == NULL) {
+            valveDur = (unsigned long) parsedDur;
+            dropsToDispense = 1;
+            succeeded = true;
+          } else {
+            int parsedN = atoi(tok);
+            if (parsedN > 0) {
+              valveDur = (unsigned long) parsedDur;
+              dropsToDispense = parsedN;
+              succeeded = true;
+            }
+          }
+        }
+      }
+
+#ifdef DEBUG
+      if (succeeded) {
+        Serial.print("Dispensing ");
+        Serial.print(dropsToDispense);
+        Serial.print(" drop(s) for ");
+        Serial.print(valveDur);
+        Serial.println(" ms each");
+      } else {
+        Serial.println("Command not understood");
+      }
+#endif
+    }
   }
+
+  // Print each piece of data to the serial port
+  Serial.print("dp:");
+  Serial.print(dP, 3);
+  Serial.print(";dr:");
+  Serial.print(dR, 3);
+  Serial.print(";dy:");
+  Serial.print(dY, 3);
+  Serial.print(";licks:");
+  Serial.print(lickCount);
+  Serial.print(";valveState:");
+  Serial.print(valveState);
+  Serial.print(";dta:");
+  Serial.print(dt);
+  Serial.print(";dtmsg:");
+  Serial.println(sinceLastMessage);
+  Serial.send_now();
+  sinceLastMessage = 0;
+  loopsSinceRead = 0;
+  lickCount = 0;
+}
+
+void loop() {
+  static double thisdP, thisdR, thisdY;
+
+  dt = sinceLastLoop;
+  sinceLastLoop = 0;
+
+#ifdef READ_INTERVAL_MS
+  if (sinceLastRead >= READ_INTERVAL_MS) {
+    sinceLastRead = 0;
+#endif
+    readXY(&xydat[0]);
+    readXY2(&xy2dat[0]);
+    thisdP = px1*xydat[0] + py1*xydat[1] + px2*xy2dat[0] + py2*xy2dat[1];
+    thisdR = rx1*xydat[0] + ry1*xydat[1] + rx2*xy2dat[0] + ry2*xy2dat[1];
+    thisdY = yx1*xydat[0] + yy1*xydat[1] + yx2*xy2dat[0] + yy2*xy2dat[1];
+    analogWrite(pVelPin, thisdP+2048);
+    analogWrite(rVelPin, thisdR+2048);
+    analogWrite(yVelPin, thisdY+2048);
+
+    // update averages
+    loopsSinceRead++;
+    dP *= (loopsSinceRead - 1) / loopsSinceRead;
+    dP += thisdP / loopsSinceRead;
+    dR *= (loopsSinceRead - 1) / loopsSinceRead;
+    dR += thisdR / loopsSinceRead;
+    dY *= (loopsSinceRead - 1) / loopsSinceRead;
+    dY += thisdY / loopsSinceRead;
+#ifdef READ_INTERVAL_MS
+  }
+#endif
+
+  // update licks
+  int lickRead = digitalRead(lickPin);
+  if (lastLick == 0 && lickRead == 1) {
+    lickCount = lickCount + 1;
+  }
+  lastLick = lickRead;
+
+  unsigned int nWritten = 0;
+  while (Serial.available() > 0) {
+    // read next char if available
+    char inByte = Serial.read();
+    if (inByte == '\n') {
+      // the new-line character ('\n') indicates a complete message
+      // so close the string and interpret the message
+      // should always maintain room for a string ending character
+      usbBuffer[nWritten] = '\0';
+      interpretCommand(usbBuffer);
+    } else {
+      // append character to message buffer
+      if (nWritten == usbBufferLength) {
+        setBufferSize(usbBufferLength * 2);
+      }
+      usbBuffer[nWritten] = inByte;
+      nWritten++;
+    }
+  }
+
+  // update valve
+  // If valve is off and valve trigger turns on, start release
+  if (valveState == 0 && dropsToDispense > 0 && sinceValveOff >= timeoutDur) {
+    dropsToDispense--;
+    startRelease();
+#ifdef DEBUG
+    Serial.println("dropping");
+#endif
+  } else if (!holdOpen && valveState == 1 && sinceValveOn >= valveDur) {
+    stopRelease();
+  }
+
+  delayMicroseconds(10);
+}
+

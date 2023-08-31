@@ -1,5 +1,11 @@
 #include <SPI.h>
 #include <avr/pgmspace.h>
+#include <cstring>
+#include <cstdlib>
+
+elapsedMillis sinceLastRead;
+elapsedMillis sinceValveOn;
+elapsedMillis sinceValveOff;
 
 byte initComplete=0;
 byte Motion = 0;
@@ -7,20 +13,26 @@ byte xH;
 byte xL;
 byte yH;
 byte yL;
+byte valveState = 0;
+byte holdOpen = 0;
+int dropsToDispense = 0;
 int xydat[2];
 int xy2dat[2];
 double dP;
 double dR;
 double dY;
-int pCum = 0;
-int rCum = 0;
-int yCum = 0;
 
 const int ncs = 0;
 const int ncs2 = 1;
 const int pVelPin = 3;
 const int rVelPin = 4;
 const int yVelPin = 5;
+const int valveTrigOut = 22;
+
+unsigned long valveMs;
+const int timeoutMs = 100; // To prevent nonlinear effects w/ multiple drops when calibrating
+char* usbBuffer = NULL;
+size_t usbBufferLength;
 
 const double px1 = 0.8151;
 const double rx1 = 0.1849;
@@ -95,57 +107,88 @@ const double yy2 = -0.7779;
 #define REG_SROM_Load_Burst                      0x62
 #define REG_Pixel_Burst                          0x64
 
+#define ADNS_SETTINGS SPISettings(2000000, MSBFIRST, SPI_MODE3)
+
 extern const unsigned short firmware_length;
 extern prog_uchar firmware_data[];
 
 void setup() {
-  Serial.begin(38400);
   analogWriteFrequency(pVelPin,11500);
   analogWriteFrequency(rVelPin,11500);
   analogWriteFrequency(yVelPin,11500);
   analogWriteResolution(12);
-  pinMode (ncs, OUTPUT);
-  pinMode (ncs2, OUTPUT);
-  
+  pinMode(ncs, OUTPUT);
+  pinMode(ncs2, OUTPUT);
+  pinMode(valveTrigOut, OUTPUT);
+  adns_reset_cs();
   SPI.begin();
-  SPI.setDataMode(SPI_MODE3);
-  SPI.setBitOrder(MSBFIRST);
-  SPI.setClockDivider(2);
   
   delay(1000);
   performStartup();
   delay(10);
   performStartup2();
   delay(10);
+  adns_write_reg(REG_Configuration_I, 0x10);
   //adns_write_reg(REG_Configuration_I, 0x29); // maximum resolution
-  adns_write_reg(REG_Configuration_I, 0x09); // default resolution
+  //adns_write_reg(REG_Configuration_I, 0x09); // default resolution
   //adns_write_reg(REG_Configuration_I, 0x01); // minimum resolution
   delay(10);
-  adns2_write_reg(REG_Configuration_I, 0x09); // default resolution
+  adns2_write_reg(REG_Configuration_I, 0x10);
+  //adns2_write_reg(REG_Configuration_I, 0x09); // default resolution
   //adns2_write_reg(REG_Configuration_I, 0x01); // minimum resolution
   delay(1500);  
   dispRegisters();
   delay(1500);
   dispRegisters2();
   delay(1500);
-  initComplete=9;
 
+  // Initialize usbBuffer to hold 10 characters - should realistically never have to expand
+  setBufferSize(10);
+
+  initComplete=9;
+}
+
+void setBufferSize(size_t n) {
+  if (usbBuffer == NULL) {
+    usbBuffer = (char*) malloc((n + 1) * sizeof(char));
+  } else {
+    usbBuffer = (char*) realloc(usbBuffer, (n + 1) * sizeof(char));
+  }
+
+  if (usbBuffer == NULL) {
+    Serial.println("Unable to allocate memory - aborting!");
+    while (true) {
+      delay(100);
+    }
+  } else {
+    usbBufferLength = n;
+  }
+}
+
+void adns_reset_cs() {
+  // Reset chip select lines to pre-transaction state
+  digitalWrite(ncs, HIGH);
+  digitalWrite(ncs2, HIGH);
 }
 
 void adns_com_begin(){
+  SPI.beginTransaction(ADNS_SETTINGS);
   digitalWrite(ncs, LOW);
 }
 
 void adns2_com_begin(){
+  SPI.beginTransaction(ADNS_SETTINGS);
   digitalWrite(ncs2, LOW);
 }
 
 void adns_com_end(){
   digitalWrite(ncs, HIGH);
+  SPI.endTransaction();
 }
 
 void adns2_com_end(){
   digitalWrite(ncs2, HIGH);
+  SPI.endTransaction();
 }
 
 byte adns_read_reg(byte reg_addr){
@@ -268,7 +311,7 @@ void adns2_upload_firmware(){
 
 
 void performStartup(void){
-  adns_com_end(); // ensure that the serial port is reset
+  // adns_com_end(); // ensure that the serial port is reset
   adns_com_begin(); // ensure that the serial port is reset
   adns_com_end(); // ensure that the serial port is reset
   adns_write_reg(REG_Power_Up_Reset, 0x5a); // force reset
@@ -295,7 +338,7 @@ void performStartup(void){
 }
 
 void performStartup2(void){
-  adns2_com_end(); // ensure that the serial port is reset
+  // adns2_com_end(); // ensure that the serial port is reset
   adns2_com_begin(); // ensure that the serial port is reset
   adns2_com_end(); // ensure that the serial port is reset
   adns2_write_reg(REG_Power_Up_Reset, 0x5a); // force reset
@@ -325,11 +368,11 @@ void performStartup2(void){
 void dispRegisters(void){
   int oreg[7] = {
     0x00,0x3F,0x2A,0x0F  };
-  char* oregname[] = {
+  const char* oregname[] = {
     "Product_ID","Inverse_Product_ID","SROM_Version","CPI"  };
   byte regres;
 
-  digitalWrite(ncs,LOW);
+  adns_com_begin();
 
   int rctr=0;
   for(rctr=0; rctr<4; rctr++){
@@ -343,17 +386,17 @@ void dispRegisters(void){
     Serial.println(regres,HEX);  
     delay(1);
   }
-  digitalWrite(ncs,HIGH);
+  adns_com_end();
 }
 
 void dispRegisters2(void){
   int oreg[7] = {
     0x00,0x3F,0x2A,0x0F  };
-  char* oregname[] = {
+  const char* oregname[] = {
     "Product_ID2","Inverse_Product_ID2","SROM_Version2","CPI2"  };
   byte regres;
 
-  digitalWrite(ncs2,LOW);
+  adns2_com_begin();
 
   int rctr=0;
   for(rctr=0; rctr<4; rctr++){
@@ -367,13 +410,13 @@ void dispRegisters2(void){
     Serial.println(regres,HEX);  
     delay(1);
   }
-  digitalWrite(ncs2,HIGH);
+  adns2_com_end();
 }
 
-int readXY(int *xy){
+void readXY(int *xy){
   //digitalWrite(ncs,LOW);
   
-  Motion = (adns_read_reg(REG_Motion) & (1 << 8-1)) != 0;
+  Motion = (adns_read_reg(REG_Motion) & (1 << 7)) != 0;
   xL = adns_read_reg(REG_Delta_X_L);
   xH = adns_read_reg(REG_Delta_X_H);
   yL = adns_read_reg(REG_Delta_Y_L);
@@ -391,10 +434,10 @@ int readXY(int *xy){
   //digitalWrite(ncs,HIGH);     
 }
 
-int readXY2(int *xy){
+void readXY2(int *xy){
   //digitalWrite(ncs2,LOW);
   
-  Motion = (adns2_read_reg(REG_Motion) & (1 << 8-1)) != 0;
+  Motion = (adns2_read_reg(REG_Motion) & (1 << 7)) != 0;
   xL = adns2_read_reg(REG_Delta_X_L);
   xH = adns2_read_reg(REG_Delta_X_H);
   yL = adns2_read_reg(REG_Delta_Y_L);
@@ -412,30 +455,114 @@ int readXY2(int *xy){
   //digitalWrite(ncs2,HIGH);     
 }
 
+void startRelease() {
+  digitalWrite(valveTrigOut, HIGH);
+  sinceValveOn = 0;
+  valveState = 1;
+}
+
+void stopRelease() {
+  digitalWrite(valveTrigOut, LOW);
+  sinceValveOff = 0;
+  valveState = 0;
+}
+
+void interpretCommand(char* message) {
+  size_t len = strlen(message);
+  if (len > 0) {
+    char char1 = message[0];
+    if (char1 == 'O') {
+      // Hold open
+      holdOpen = 1;
+      startRelease();
+#ifdef DEBUG
+      Serial.println("Holding valve open");
+#endif
+    } else if (char1 == 'C') {
+      // Stop holding
+      holdOpen = 0;
+      stopRelease();
+#ifdef DEBUG
+      Serial.println("Closing valve");
+#endif
+    } else {
+      bool succeeded = false;
+      // Get # of ms to open valve for each drop
+      char* tok = strtok(message, "xX");
+      if (tok != NULL) {
+        int parsedDur = atoi(tok);
+        if (parsedDur > 0) {
+          // Get # of drops to release
+          tok = strtok(NULL, "xX");
+          if (tok == NULL) {
+            valveMs = (unsigned long) parsedDur;
+            dropsToDispense = 1;
+            succeeded = true;
+          } else {
+            int parsedN = atoi(tok);
+            if (parsedN > 0) {
+              valveMs = (unsigned long) parsedDur;
+              dropsToDispense = parsedN;
+              succeeded = true;
+            }
+          }
+        }
+      }
+
+#ifdef DEBUG
+      if (succeeded) {
+        Serial.print("Dispensing ");
+        Serial.print(dropsToDispense);
+        Serial.print(" drop(s) for ");
+        Serial.print(valveDur);
+        Serial.println(" ms each");
+      } else {
+        Serial.println("Command not understood");
+      }
+#endif
+    }
+  }
+}
   
-  void loop() {
-    Serial.println("Made it 0");
+void loop() {
+  // Read ball data every 10 ms
+  if (sinceLastRead >= 10) {
+    sinceLastRead = 0;
     readXY(&xydat[0]);
-    Serial.println("Made it 1");
     readXY2(&xy2dat[0]);
-    Serial.println("Made it 2");
     dP = px1*xydat[0] + py1*xydat[1] + px2*xy2dat[0] + py2*xy2dat[1];
     dR = rx1*xydat[0] + ry1*xydat[1] + rx2*xy2dat[0] + ry2*xy2dat[1];
     dY = yx1*xydat[0] + yy1*xydat[1] + yx2*xy2dat[0] + yy2*xy2dat[1];
-    Serial.println("Made it 3");
     analogWrite(pVelPin,dP+2048);
     analogWrite(rVelPin,dR+2048);
     analogWrite(yVelPin,dY+2048);
-    pCum = pCum*0.9 + dP;
-    rCum = rCum*0.9 + dR;
-    yCum = yCum*0.9 + dY;
-    
-    Serial.println("Prod ID = " + String(adns_read_reg(REG_Product_ID)));
-    Serial.println("Prod2 ID = " + String(adns2_read_reg(REG_Product_ID)));
-    Serial.println("intP = " + String(pCum));
-    Serial.println("intR = " + String(rCum));
-    Serial.println("intY = " + String(yCum));
-    Serial.println("Squal = " + String(adns_read_reg(REG_SQUAL)));
-    Serial.println("Squal2 = " + String(adns2_read_reg(REG_SQUAL)));
-    delay(10);
   }
+
+  unsigned int nWritten = 0;
+  while (Serial.available() > 0) {
+    // read next char if available
+    char inByte = Serial.read();
+    if (inByte == '\n') {
+      // the new-line character ('\n') indicates a complete message
+      // so close the string and interpret the message
+      // should always maintain room for a string ending character
+      usbBuffer[nWritten] = '\0';
+      interpretCommand(usbBuffer);
+    } else {
+      // append character to message buffer
+      if (nWritten == usbBufferLength) {
+        setBufferSize(usbBufferLength * 2);
+      }
+      usbBuffer[nWritten] = inByte;
+      nWritten++;
+    }
+  }
+
+  // If valve is off and valve trigger turns on, start release
+  if (valveState == 0 && dropsToDispense > 0 && sinceValveOff >= timeoutMs) {
+    dropsToDispense--;
+    startRelease();
+  } else if (!holdOpen && valveState == 1 && sinceValveOn >= valveMs) {
+    stopRelease();
+  }
+}
